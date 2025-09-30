@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "692739922531",
+    "project_id": "beyondh0rizon",
+    "storage_bucket": "beyondh0rizon.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:692739922531:android:2e28a58afb2172d5a37656",
+        "android_client_info": {
+          "package_name": "com.example.beyond_horizon2"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBtmmpdqOwaCcBXFV8DTcBTegf7YMsAJFo"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
