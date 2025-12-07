@@ -1,8 +1,9 @@
 import 'dart:async';
+import 'dart:collection'; // Import para filas (Queue)
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:google_fonts/google_fonts.dart';
+import 'package:google_fonts/google_fonts.dart'; // Mantido para fontes seguras, se houver internet
 import 'package:flutter_tts/flutter_tts.dart';
 
 void main() {
@@ -18,9 +19,9 @@ class MyApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'Assistente Visual',
       theme: ThemeData.dark().copyWith(
-        scaffoldBackgroundColor: const Color(0xFF000000), // Preto absoluto para contraste
+        scaffoldBackgroundColor: const Color(0xFF000000), // Preto absoluto (Alto Contraste)
         primaryColor: Colors.blueAccent,
-        textTheme: GoogleFonts.robotoTextTheme(ThemeData.dark().textTheme),
+        textTheme: ThemeData.dark().textTheme,
       ),
       home: const SensorDashboard(),
     );
@@ -35,13 +36,13 @@ class SensorDashboard extends StatefulWidget {
 }
 
 class _SensorDashboardState extends State<SensorDashboard> {
-  // --- CONFIGURAÇÃO DO BLE ---
+  // --- CONFIGURAÇÃO BLE (UUIDs do ESP32) ---
   final String targetDeviceName = "ESP32_Capacete";
   final String serviceUuid = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
 
-  final String charUuidS1 = "beb5483e-36e1-4688-b7f5-ea07361b26a8"; // Frente
-  final String charUuidS2 = "1c95d5e5-0466-4aa8-b8d9-e31d0ebf8453"; // Esquerda
-  final String charUuidS3 = "aa2b5a6c-486a-4b68-b118-a61f5c6b6d3b"; // Direita
+  final String charUuidS1 = "beb5483e-36e1-4688-b7f5-ea07361b26a8"; // FRENTE
+  final String charUuidS2 = "1c95d5e5-0466-4aa8-b8d9-e31d0ebf8453"; // ESQUERDA
+  final String charUuidS3 = "aa2b5a6c-486a-4b68-b118-a61f5c6b6d3b"; // DIREITA
 
   // --- VARIÁVEIS DE CONTROLE ---
   BluetoothDevice? _device;
@@ -52,21 +53,28 @@ class _SensorDashboardState extends State<SensorDashboard> {
   bool _isScanning = false;
   String _status = "Toque em CONECTAR";
 
-  // Valores para Exibição na Tela (UI)
+  // Valores de Tela
   String txtFrente = "--";
   String txtEsq = "--";
   String txtDir = "--";
 
-  // --- MEMÓRIA (BUFFER) PARA ANÁLISE INTELIGENTE ---
-  // Guardamos as últimas 10 leituras para analisar tendências
-  final int tamanhoBuffer = 10;
+  // --- BUFFER DE MEMÓRIA (Janela Deslizante) ---
+  final int tamanhoBuffer = 10; // ~1 segundo de histórico
   List<double> histFrente = [];
   List<double> histEsq = [];
   List<double> histDir = [];
 
-  // --- CONFIGURAÇÃO DE FALA (TTS) ---
+  // --- SISTEMA DE ÁUDIO (DUPLA FILA) ---
   final FlutterTts flutterTts = FlutterTts();
-  DateTime lastSpoken = DateTime.now(); // Timer para não falar demais
+  final Queue<String> _filaAltaPrioridade = Queue<String>();   // Emergências (PARE!)
+  final Queue<String> _filaNormalPrioridade = Queue<String>(); // Navegação (Porta, Corredor)
+
+  bool _processandoAudio = false;
+  bool _falandoAlgoDeAltaPrioridade = false;
+
+  // Controle de repetição (Spam Filter)
+  String _ultimaMensagemDita = "";
+  DateTime _tempoUltimaFala = DateTime.now();
 
   @override
   void initState() {
@@ -85,136 +93,175 @@ class _SensorDashboardState extends State<SensorDashboard> {
   }
 
   Future<void> _checkPermissions() async {
-    await [
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-      Permission.location,
-    ].request();
+    await [Permission.bluetoothScan, Permission.bluetoothConnect, Permission.location].request();
   }
 
   Future<void> _initTTS() async {
     await flutterTts.setLanguage("pt-BR");
-    await flutterTts.setSpeechRate(0.6); // Velocidade um pouco mais lenta para clareza
+    await flutterTts.setSpeechRate(0.6); // Fala pausada e clara
     await flutterTts.setVolume(1.0);
-    await flutterTts.setPitch(1.0);
+    // CRÍTICO: Garante que o app espere a voz terminar antes de continuar a fila
+    await flutterTts.awaitSpeakCompletion(true);
   }
 
   // =================================================================
-  // --- LÓGICA DE INTELIGÊNCIA ARTIFICIAL (ANÁLISE DE AMBIENTE) ---
+  // --- GERENCIADOR DE ÁUDIO (PRIORITY QUEUE) ---
   // =================================================================
 
-  // Auxiliar: Calcula média de uma lista
+  void _adicionarFilaVoz(String mensagem, {bool ehAltaPrioridade = false}) async {
+    // Filtro Anti-Spam: Não repete a mesma frase em menos de 3 segundos
+    if (_ultimaMensagemDita == mensagem && DateTime.now().difference(_tempoUltimaFala).inSeconds < 3) {
+      return;
+    }
+
+    if (ehAltaPrioridade) {
+      if (!_filaAltaPrioridade.contains(mensagem)) {
+        _filaAltaPrioridade.add(mensagem);
+
+
+        if (_processandoAudio && !_falandoAlgoDeAltaPrioridade) {
+          await flutterTts.stop();
+        }
+      }
+    } else {
+      // Mensagens normais entram no fim da fila
+      if (!_filaNormalPrioridade.contains(mensagem) && !_filaAltaPrioridade.contains(mensagem)) {
+        _filaNormalPrioridade.add(mensagem);
+      }
+    }
+
+    // Se o processador de áudio estiver dormindo, acorda ele
+    if (!_processandoAudio) _processarFilasDeAudio();
+  }
+
+  Future<void> _processarFilasDeAudio() async {
+    if (_processandoAudio) return;
+    _processandoAudio = true;
+
+    // Loop enquanto houver mensagens
+    while (_filaAltaPrioridade.isNotEmpty || _filaNormalPrioridade.isNotEmpty) {
+      String msg = "";
+
+      // 1. Sempre verifica a Alta Prioridade primeiro
+      if (_filaAltaPrioridade.isNotEmpty) {
+        msg = _filaAltaPrioridade.removeFirst();
+        _falandoAlgoDeAltaPrioridade = true; // Protege contra interrupção
+      }
+      // 2. Só atende a Normal se a Alta estiver vazia
+      else if (_filaNormalPrioridade.isNotEmpty) {
+        msg = _filaNormalPrioridade.removeFirst();
+        _falandoAlgoDeAltaPrioridade = false; // Pode ser interrompido
+      }
+
+      if (msg.isNotEmpty) {
+        _ultimaMensagemDita = msg;
+        _tempoUltimaFala = DateTime.now();
+        await flutterTts.speak(msg);
+        // Pequena pausa para respiração entre frases
+        await Future.delayed(const Duration(milliseconds: 200));
+      }
+    }
+
+    _processandoAudio = false;
+    _falandoAlgoDeAltaPrioridade = false;
+  }
+
+  // =================================================================
+  // --- INTELIGÊNCIA ARTIFICIAL (ANÁLISE DE PADRÕES) ---
+  // =================================================================
+
   double _calcularMedia(List<double> lista) {
     if (lista.isEmpty) return 400.0;
     double soma = lista.reduce((a, b) => a + b);
     return soma / lista.length;
   }
 
-  // Gerencia o Buffer: Adiciona novo, remove antigo
   void _adicionarAoHistorico(List<double> lista, double valor) {
-    // Ignora leituras < 2cm (ruído do sensor)
+    // Filtra ruído elétrico do sensor (< 2cm)
     if (valor <= 2.0) return;
-
     lista.add(valor);
-    if (lista.length > tamanhoBuffer) {
-      lista.removeAt(0); // Remove o mais antigo
-    }
+    if (lista.length > tamanhoBuffer) lista.removeAt(0);
   }
 
-  // O CÉREBRO: Analisa os dados e decide o que falar
   void _analisarPadroes() {
-    // 1. Verifica se temos dados suficientes (mínimo 5 leituras)
-    if (histFrente.length < 5 || histEsq.length < 5 || histDir.length < 5) return;
+    // Só analisa se o buffer estiver cheio (dados confiáveis)
+    if (histFrente.length < tamanhoBuffer || histEsq.length < tamanhoBuffer || histDir.length < tamanhoBuffer) return;
 
-    // 2. Verifica timer: Só fala a cada 3 segundos (exceto emergência)
-    if (DateTime.now().difference(lastSpoken).inMilliseconds < 3000) {
-      // Exceção: Se for emergência (muito perto), fala agora mesmo!
-      if (histFrente.last < 50) { /* deixa passar */ } else { return; }
+    // --- CÁLCULO DE MÉDIAS ---
+    double mediaFrente = _calcularMedia(histFrente); // Estado Atual Geral
+
+    // Comparação Passado (Início do Buffer) vs Presente (Fim do Buffer)
+    // Usamos blocos de 5 leituras para evitar falsos positivos
+    double mediaAntigaFrente = _calcularMedia(histFrente.sublist(0, 5));
+    double mediaRecenteFrente = _calcularMedia(histFrente.sublist(histFrente.length - 5));
+
+    double mediaAntigaEsq = _calcularMedia(histEsq.sublist(0, 5));
+    double mediaRecenteEsq = _calcularMedia(histEsq.sublist(histEsq.length - 5));
+
+    double mediaAntigaDir = _calcularMedia(histDir.sublist(0, 5));
+    double mediaRecenteDir = _calcularMedia(histDir.sublist(histDir.length - 5));
+
+
+    // 1. EMERGÊNCIA (PARE!) - Prioridade Alta
+    if (mediaFrente < 60) {
+      _adicionarFilaVoz("Pare! Frente.", ehAltaPrioridade: true);
+      return;
     }
 
-    // Calcula as médias atuais
-    double mediaFrente = _calcularMedia(histFrente);
-    double mediaEsq = _calcularMedia(histEsq);
-    double mediaDir = _calcularMedia(histDir);
-
-    String mensagem = "";
-
-    // --- ANÁLISE DE SEGURANÇA (CRÍTICO) ---
-    if (histFrente.last < 60) {
-      mensagem = "Pare. Obstáculo à frente.";
+    // 2. TENDÊNCIA DE APROXIMAÇÃO (Diferença > 30cm) - Prioridade Alta
+    if ((mediaAntigaEsq - mediaRecenteEsq > 30) && mediaRecenteEsq < 150) {
+      _adicionarFilaVoz("Aproximando esquerda.", ehAltaPrioridade: true);
     }
-    else if (histEsq.last < 40) {
-      mensagem = "Muito perto da esquerda.";
+    if ((mediaAntigaDir - mediaRecenteDir > 30) && mediaRecenteDir < 150) {
+      _adicionarFilaVoz("Aproximando direita.", ehAltaPrioridade: true);
     }
-    else if (histDir.last < 40) {
-      mensagem = "Muito perto da direita.";
+    if ((mediaAntigaFrente - mediaRecenteFrente > 40) && mediaRecenteFrente < 180) {
+      _adicionarFilaVoz("Aproximando frente.", ehAltaPrioridade: true);
     }
 
-    // --- ANÁLISE DE TENDÊNCIA (APROXIMAÇÃO) ---
-    // Se estava longe (início da lista) e agora está perto (fim da lista)
-    // Ex: 200 -> 180 -> 160 -> 140
-    else if ((histFrente.first - histFrente.last > 60) && mediaFrente < 150) {
-      mensagem = "Aproximando de obstáculo.";
+    // 3. DETECÇÃO DE AMBIENTE - Prioridade Normal
+
+    // Aberturas (Portas): Estava perto (<80) e ficou longe (>150)
+    if (mediaAntigaEsq < 80 && mediaRecenteEsq > 150) {
+      _adicionarFilaVoz("Abertura Esquerda.");
     }
-
-    // --- ANÁLISE DE DETECÇÃO DE ABERTURA (PORTA) ---
-    // Média antiga era BAIXA (<80), Média recente é ALTA (>150)
-    else {
-      double esqAntiga = _calcularMedia(histEsq.sublist(0, 5));
-      double esqRecente = _calcularMedia(histEsq.sublist(histEsq.length - 3));
-
-      double dirAntiga = _calcularMedia(histDir.sublist(0, 5));
-      double dirRecente = _calcularMedia(histDir.sublist(histDir.length - 3));
-
-      if (esqAntiga < 80 && esqRecente > 150) {
-        mensagem = "Abertura à esquerda.";
-      }
-      else if (dirAntiga < 80 && dirRecente > 150) {
-        mensagem = "Abertura à direita.";
-      }
-
-      // --- ANÁLISE DE CORREDOR ---
-      // Esquerda e Direita apertadas, Frente livre
-      else if (mediaEsq < 100 && mediaDir < 100 && mediaFrente > 150) {
-        mensagem = "Corredor detectado. Siga em frente.";
-      }
+    else if (mediaAntigaDir < 80 && mediaRecenteDir > 150) {
+      _adicionarFilaVoz("Abertura Direita.");
     }
-
-    // --- EXECUTAR FALA ---
-    if (mensagem.isNotEmpty) {
-      flutterTts.speak(mensagem);
-      lastSpoken = DateTime.now(); // Reseta timer
+    // Corredor: Apertado nos dois lados, livre na frente
+    else if (mediaRecenteEsq < 110 && mediaRecenteDir < 110 && mediaRecenteFrente > 150) {
+      _adicionarFilaVoz("Corredor detectado.");
     }
   }
 
-  // Função chamada quando chega dado do Bluetooth
+  // --- PROCESSAMENTO PRINCIPAL ---
   void _processarSensor(String valorRaw, Function(String) updateUI, List<double> bufferHistorico) {
     try {
-      double distancia = double.parse(valorRaw);
+      double distanciaBruta = double.parse(valorRaw);
 
-      // Atualiza UI
-      if (mounted) updateUI(valorRaw);
+      // 1. Guarda Bruto na memória
+      _adicionarAoHistorico(bufferHistorico, distanciaBruta);
 
-      // Adiciona na memória e analisa
-      _adicionarAoHistorico(bufferHistorico, distancia);
+      // 2. Calcula Média para estabilidade
+      double media = _calcularMedia(bufferHistorico);
+
+      // 3. Atualiza a Tela com a MÉDIA (e não o valor bruto que pisca)
+      if (mounted) updateUI(media.toStringAsFixed(0));
+
+      // 4. Analisa perigos usando a Média
       _analisarPadroes();
 
-    } catch (e) {
-      // Ignora erro de parse
-    }
+    } catch (e) { }
   }
 
   // =================================================================
-  // --- LÓGICA BLUETOOTH (CONEXÃO) ---
+  // --- BLUETOOTH ---
   // =================================================================
 
   void _startScan() {
     if (_isConnected) { _disconnect(); return; }
-
-    setState(() { _isScanning = true; _status = "Procurando Capacete..."; });
-
+    setState(() { _isScanning = true; _status = "Procurando..."; });
     FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
-
     _scanSub = FlutterBluePlus.onScanResults.listen((results) {
       for (ScanResult r in results) {
         if (r.device.platformName == targetDeviceName) {
@@ -224,7 +271,6 @@ class _SensorDashboardState extends State<SensorDashboard> {
         }
       }
     });
-
     Future.delayed(const Duration(seconds: 5), () {
       if (!_isConnected && mounted) {
         setState(() { _isScanning = false; _status = "Não encontrado."; });
@@ -235,6 +281,7 @@ class _SensorDashboardState extends State<SensorDashboard> {
   Future<void> _connectToDevice(BluetoothDevice device) async {
     setState(() => _status = "Conectando...");
     try {
+      // Conexão padrão sem parâmetros extras
       await device.connect(autoConnect: false,license: License.free);
       _device = device;
 
@@ -243,20 +290,18 @@ class _SensorDashboardState extends State<SensorDashboard> {
           setState(() {
             _isConnected = false; _status = "Conexão Perdida";
             txtFrente = "--"; txtEsq = "--"; txtDir = "--";
-            // Limpa históricos para não dar avisos falsos ao reconectar
             histFrente.clear(); histEsq.clear(); histDir.clear();
           });
-          flutterTts.speak("Conexão perdida");
+          _adicionarFilaVoz("Conexão perdida", ehAltaPrioridade: true);
         }
       });
 
       if (mounted) {
         setState(() { _isConnected = true; _isScanning = false; _status = "Sistema Ativo"; });
-        flutterTts.speak("Sistema conectado. Iniciando navegação.");
+        _adicionarFilaVoz("Conectado.", ehAltaPrioridade: true);
       }
 
       await _discoverServices(device);
-
     } catch (e) {
       if (mounted) setState(() => _status = "Erro de Conexão");
     }
@@ -270,22 +315,17 @@ class _SensorDashboardState extends State<SensorDashboard> {
           String uuid = c.uuid.toString();
           await c.setNotifyValue(true);
 
-          if (uuid == charUuidS1) { // Frente
+          if (uuid == charUuidS1) { // S1 = Frente
             _subS1 = c.lastValueStream.listen((val) {
-              String s = String.fromCharCodes(val);
-              _processarSensor(s, (v) => setState(() => txtFrente = v), histFrente);
+              _processarSensor(String.fromCharCodes(val), (v) => setState(() => txtFrente = v), histFrente);
             });
-          }
-          else if (uuid == charUuidS2) { // Esquerda
+          } else if (uuid == charUuidS2) { // S2 = Esquerda
             _subS2 = c.lastValueStream.listen((val) {
-              String s = String.fromCharCodes(val);
-              _processarSensor(s, (v) => setState(() => txtEsq = v), histEsq);
+              _processarSensor(String.fromCharCodes(val), (v) => setState(() => txtEsq = v), histEsq);
             });
-          }
-          else if (uuid == charUuidS3) { // Direita
+          } else if (uuid == charUuidS3) { // S3 = Direita
             _subS3 = c.lastValueStream.listen((val) {
-              String s = String.fromCharCodes(val);
-              _processarSensor(s, (v) => setState(() => txtDir = v), histDir);
+              _processarSensor(String.fromCharCodes(val), (v) => setState(() => txtDir = v), histDir);
             });
           }
         }
@@ -299,14 +339,15 @@ class _SensorDashboardState extends State<SensorDashboard> {
   }
 
   // =================================================================
-  // --- INTERFACE GRÁFICA (ALTO CONTRASTE) ---
+  // --- INTERFACE GRÁFICA (UI) ---
   // =================================================================
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text("Navegação Assistiva", style: GoogleFonts.orbitron(fontWeight: FontWeight.bold)),
+        // Sem GoogleFonts para não travar offline
+        title: const Text("Assistente Visual", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 24)),
         backgroundColor: Colors.transparent,
         elevation: 0,
         centerTitle: true,
@@ -325,6 +366,7 @@ class _SensorDashboardState extends State<SensorDashboard> {
             ),
           ),
 
+          // Cards dos Sensores
           Expanded(
             child: Padding(
               padding: const EdgeInsets.all(16.0),
@@ -339,7 +381,7 @@ class _SensorDashboardState extends State<SensorDashboard> {
             ),
           ),
 
-          // Botão Grande
+          // Botão de Ação
           Padding(
             padding: const EdgeInsets.fromLTRB(20, 0, 20, 30),
             child: SizedBox(
@@ -354,7 +396,7 @@ class _SensorDashboardState extends State<SensorDashboard> {
                 onPressed: _isScanning ? null : (_isConnected ? _disconnect : _startScan),
                 style: ElevatedButton.styleFrom(
                   backgroundColor: _isConnected ? Colors.red[800] : Colors.yellowAccent,
-                  foregroundColor: _isConnected ? Colors.white : Colors.black, // Contraste texto/fundo
+                  foregroundColor: _isConnected ? Colors.white : Colors.black,
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                 ),
               ),
@@ -366,16 +408,16 @@ class _SensorDashboardState extends State<SensorDashboard> {
   }
 
   Widget _buildCard(String label, String value, Color color, {bool isMain = false}) {
-    // Formata o valor para a tela (se for 400 mostra >4m)
-    String display = (value == "400.0" || value == "400") ? "> 4m" : value;
+    // Tratamento visual para "infinito"
+    String display = (value == "400" || value == "400.0") ? "> 4m" : value;
 
     return Container(
       width: double.infinity,
       padding: EdgeInsets.symmetric(vertical: isMain ? 30 : 20, horizontal: 20),
       decoration: BoxDecoration(
-        color: const Color(0xFF1E1E1E), // Cinza muito escuro
+        color: const Color(0xFF1E1E1E),
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: color, width: isMain ? 3 : 1), // Borda colorida para identificação
+        border: Border.all(color: color, width: isMain ? 3 : 1),
       ),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -385,10 +427,11 @@ class _SensorDashboardState extends State<SensorDashboard> {
             children: [
               Text(
                 display,
-                style: GoogleFonts.orbitron(
-                  fontSize: isMain ? 48 : 36,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white,
+                style: const TextStyle(
+                    fontSize: 36,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                    fontFamily: 'Monospace' // Fonte monoespaçada nativa (segura offline)
                 ),
               ),
               if (display != "> 4m" && display != "--")
