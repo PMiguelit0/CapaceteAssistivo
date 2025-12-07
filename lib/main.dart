@@ -1,241 +1,405 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
-
-// --- Cole os mesmos 4 UUIDs da Fase 3 aqui ---
-const String SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
-const String CHARACTERISTIC_UUID_S1 = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
-const String CHARACTERISTIC_UUID_S2 = "1c95d5e5-0466-4aa8-b8d9-e31d0ebf8453";
-const String CHARACTERISTIC_UUID_S3 = "aa2b5a6c-486a-4b68-b118-a61f5c6b6d3b";
-// -----------------------------------------------------
+import 'package:permission_handler/permission_handler.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:flutter_tts/flutter_tts.dart';
 
 void main() {
-  runApp(MyApp());
+  runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Sensores ESP32',
-      theme: ThemeData(primarySwatch: Colors.blue),
-      home: SensorScreen(),
+      debugShowCheckedModeBanner: false,
+      title: 'Assistente Visual',
+      theme: ThemeData.dark().copyWith(
+        scaffoldBackgroundColor: const Color(0xFF000000), // Preto absoluto para contraste
+        primaryColor: Colors.blueAccent,
+        textTheme: GoogleFonts.robotoTextTheme(ThemeData.dark().textTheme),
+      ),
+      home: const SensorDashboard(),
     );
   }
 }
 
-class SensorScreen extends StatefulWidget {
+class SensorDashboard extends StatefulWidget {
+  const SensorDashboard({super.key});
+
   @override
-  _SensorScreenState createState() => _SensorScreenState();
+  State<SensorDashboard> createState() => _SensorDashboardState();
 }
 
-class _SensorScreenState extends State<SensorScreen> {
-  BluetoothDevice? _esp32Device;
+class _SensorDashboardState extends State<SensorDashboard> {
+  // --- CONFIGURAÇÃO DO BLE ---
+  final String targetDeviceName = "ESP32_Capacete";
+  final String serviceUuid = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+
+  final String charUuidS1 = "beb5483e-36e1-4688-b7f5-ea07361b26a8"; // Frente
+  final String charUuidS2 = "1c95d5e5-0466-4aa8-b8d9-e31d0ebf8453"; // Esquerda
+  final String charUuidS3 = "aa2b5a6c-486a-4b68-b118-a61f5c6b6d3b"; // Direita
+
+  // --- VARIÁVEIS DE CONTROLE ---
+  BluetoothDevice? _device;
+  StreamSubscription? _scanSub;
+  StreamSubscription? _subS1, _subS2, _subS3;
+
   bool _isConnected = false;
-  String _statusMessage = "Procurando por 'ESP32_Sensores'...";
+  bool _isScanning = false;
+  String _status = "Toque em CONECTAR";
 
-  // Ponteiros para as características
-  BluetoothCharacteristic? _sensor1Char;
-  BluetoothCharacteristic? _sensor2Char;
-  BluetoothCharacteristic? _sensor3Char;
+  // Valores para Exibição na Tela (UI)
+  String txtFrente = "--";
+  String txtEsq = "--";
+  String txtDir = "--";
 
-  // Variáveis para guardar as leituras
-  String _distancia1 = "---";
-  String _distancia2 = "---";
-  String _distancia3 = "---";
+  // --- MEMÓRIA (BUFFER) PARA ANÁLISE INTELIGENTE ---
+  // Guardamos as últimas 10 leituras para analisar tendências
+  final int tamanhoBuffer = 10;
+  List<double> histFrente = [];
+  List<double> histEsq = [];
+  List<double> histDir = [];
 
-  // Streams para "ouvir" as notificações
-  StreamSubscription<List<int>>? _s1Subscription;
-  StreamSubscription<List<int>>? _s2Subscription;
-  StreamSubscription<List<int>>? _s3Subscription;
+  // --- CONFIGURAÇÃO DE FALA (TTS) ---
+  final FlutterTts flutterTts = FlutterTts();
+  DateTime lastSpoken = DateTime.now(); // Timer para não falar demais
 
   @override
   void initState() {
     super.initState();
-    _startScan();
+    _checkPermissions();
+    _initTTS();
   }
 
   @override
   void dispose() {
-    // Limpa tudo ao sair da tela
-    _s1Subscription?.cancel();
-    _s2Subscription?.cancel();
-    _s3Subscription?.cancel();
-    _esp32Device?.disconnect();
+    _scanSub?.cancel();
+    _subS1?.cancel(); _subS2?.cancel(); _subS3?.cancel();
+    _device?.disconnect();
+    flutterTts.stop();
     super.dispose();
   }
 
-  // 1. Inicia o Scan por dispositivos
+  Future<void> _checkPermissions() async {
+    await [
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.location,
+    ].request();
+  }
+
+  Future<void> _initTTS() async {
+    await flutterTts.setLanguage("pt-BR");
+    await flutterTts.setSpeechRate(0.6); // Velocidade um pouco mais lenta para clareza
+    await flutterTts.setVolume(1.0);
+    await flutterTts.setPitch(1.0);
+  }
+
+  // =================================================================
+  // --- LÓGICA DE INTELIGÊNCIA ARTIFICIAL (ANÁLISE DE AMBIENTE) ---
+  // =================================================================
+
+  // Auxiliar: Calcula média de uma lista
+  double _calcularMedia(List<double> lista) {
+    if (lista.isEmpty) return 400.0;
+    double soma = lista.reduce((a, b) => a + b);
+    return soma / lista.length;
+  }
+
+  // Gerencia o Buffer: Adiciona novo, remove antigo
+  void _adicionarAoHistorico(List<double> lista, double valor) {
+    // Ignora leituras < 2cm (ruído do sensor)
+    if (valor <= 2.0) return;
+
+    lista.add(valor);
+    if (lista.length > tamanhoBuffer) {
+      lista.removeAt(0); // Remove o mais antigo
+    }
+  }
+
+  // O CÉREBRO: Analisa os dados e decide o que falar
+  void _analisarPadroes() {
+    // 1. Verifica se temos dados suficientes (mínimo 5 leituras)
+    if (histFrente.length < 5 || histEsq.length < 5 || histDir.length < 5) return;
+
+    // 2. Verifica timer: Só fala a cada 3 segundos (exceto emergência)
+    if (DateTime.now().difference(lastSpoken).inMilliseconds < 3000) {
+      // Exceção: Se for emergência (muito perto), fala agora mesmo!
+      if (histFrente.last < 50) { /* deixa passar */ } else { return; }
+    }
+
+    // Calcula as médias atuais
+    double mediaFrente = _calcularMedia(histFrente);
+    double mediaEsq = _calcularMedia(histEsq);
+    double mediaDir = _calcularMedia(histDir);
+
+    String mensagem = "";
+
+    // --- ANÁLISE DE SEGURANÇA (CRÍTICO) ---
+    if (histFrente.last < 60) {
+      mensagem = "Pare. Obstáculo à frente.";
+    }
+    else if (histEsq.last < 40) {
+      mensagem = "Muito perto da esquerda.";
+    }
+    else if (histDir.last < 40) {
+      mensagem = "Muito perto da direita.";
+    }
+
+    // --- ANÁLISE DE TENDÊNCIA (APROXIMAÇÃO) ---
+    // Se estava longe (início da lista) e agora está perto (fim da lista)
+    // Ex: 200 -> 180 -> 160 -> 140
+    else if ((histFrente.first - histFrente.last > 60) && mediaFrente < 150) {
+      mensagem = "Aproximando de obstáculo.";
+    }
+
+    // --- ANÁLISE DE DETECÇÃO DE ABERTURA (PORTA) ---
+    // Média antiga era BAIXA (<80), Média recente é ALTA (>150)
+    else {
+      double esqAntiga = _calcularMedia(histEsq.sublist(0, 5));
+      double esqRecente = _calcularMedia(histEsq.sublist(histEsq.length - 3));
+
+      double dirAntiga = _calcularMedia(histDir.sublist(0, 5));
+      double dirRecente = _calcularMedia(histDir.sublist(histDir.length - 3));
+
+      if (esqAntiga < 80 && esqRecente > 150) {
+        mensagem = "Abertura à esquerda.";
+      }
+      else if (dirAntiga < 80 && dirRecente > 150) {
+        mensagem = "Abertura à direita.";
+      }
+
+      // --- ANÁLISE DE CORREDOR ---
+      // Esquerda e Direita apertadas, Frente livre
+      else if (mediaEsq < 100 && mediaDir < 100 && mediaFrente > 150) {
+        mensagem = "Corredor detectado. Siga em frente.";
+      }
+    }
+
+    // --- EXECUTAR FALA ---
+    if (mensagem.isNotEmpty) {
+      flutterTts.speak(mensagem);
+      lastSpoken = DateTime.now(); // Reseta timer
+    }
+  }
+
+  // Função chamada quando chega dado do Bluetooth
+  void _processarSensor(String valorRaw, Function(String) updateUI, List<double> bufferHistorico) {
+    try {
+      double distancia = double.parse(valorRaw);
+
+      // Atualiza UI
+      if (mounted) updateUI(valorRaw);
+
+      // Adiciona na memória e analisa
+      _adicionarAoHistorico(bufferHistorico, distancia);
+      _analisarPadroes();
+
+    } catch (e) {
+      // Ignora erro de parse
+    }
+  }
+
+  // =================================================================
+  // --- LÓGICA BLUETOOTH (CONEXÃO) ---
+  // =================================================================
+
   void _startScan() {
-    setState(() {
-      _statusMessage = "Procurando 'ESP32_Sensores'...";
-      _distancia1 = _distancia2 = _distancia3 = "---";
-      _isConnected = false;
-    });
+    if (_isConnected) { _disconnect(); return; }
 
-    FlutterBluePlus.startScan(timeout: Duration(seconds: 5));
+    setState(() { _isScanning = true; _status = "Procurando Capacete..."; });
 
-    // Ouve os resultados do scan
-    FlutterBluePlus.scanResults.listen((results) {
+    FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
+
+    _scanSub = FlutterBluePlus.onScanResults.listen((results) {
       for (ScanResult r in results) {
-        // Compara o nome do dispositivo com o nome definido no ESP32
-        if (r.device.platformName == "ESP32_Sensores") {
-          FlutterBluePlus.stopScan(); // Para o scan
-          _connectToDevice(r.device); // Conecta ao dispositivo
+        if (r.device.platformName == targetDeviceName) {
+          FlutterBluePlus.stopScan();
+          _connectToDevice(r.device);
           break;
         }
       }
     });
+
+    Future.delayed(const Duration(seconds: 5), () {
+      if (!_isConnected && mounted) {
+        setState(() { _isScanning = false; _status = "Não encontrado."; });
+      }
+    });
   }
 
-  // 2. Conecta ao dispositivo encontrado
-  void _connectToDevice(BluetoothDevice device) async {
-    setState(() {
-      _statusMessage = "Conectando...";
-    });
-
+  Future<void> _connectToDevice(BluetoothDevice device) async {
+    setState(() => _status = "Conectando...");
     try {
-      await device.connect(license:License.free);
+      await device.connect(autoConnect: false,license: License.free);
+      _device = device;
 
-      setState(() {
-        _esp32Device = device;
-        _isConnected = true;
-        _statusMessage = "Conectado! Buscando serviços...";
+      device.connectionState.listen((state) {
+        if (state == BluetoothConnectionState.disconnected && mounted) {
+          setState(() {
+            _isConnected = false; _status = "Conexão Perdida";
+            txtFrente = "--"; txtEsq = "--"; txtDir = "--";
+            // Limpa históricos para não dar avisos falsos ao reconectar
+            histFrente.clear(); histEsq.clear(); histDir.clear();
+          });
+          flutterTts.speak("Conexão perdida");
+        }
       });
 
-      _discoverServices(); // Busca os serviços/características
+      if (mounted) {
+        setState(() { _isConnected = true; _isScanning = false; _status = "Sistema Ativo"; });
+        flutterTts.speak("Sistema conectado. Iniciando navegação.");
+      }
+
+      await _discoverServices(device);
+
     } catch (e) {
-      setState(() {
-        _statusMessage = "Falha ao conectar: $e";
-      });
+      if (mounted) setState(() => _status = "Erro de Conexão");
     }
   }
 
-  // 3. Descobre os Serviços e Características
-  void _discoverServices() async {
-    if (_esp32Device == null) return;
+  Future<void> _discoverServices(BluetoothDevice device) async {
+    List<BluetoothService> services = await device.discoverServices();
+    for (var service in services) {
+      if (service.uuid.toString() == serviceUuid) {
+        for (var c in service.characteristics) {
+          String uuid = c.uuid.toString();
+          await c.setNotifyValue(true);
 
-    List<BluetoothService> services = await _esp32Device!.discoverServices();
-    for (BluetoothService service in services) {
-      // Compara o UUID do Serviço
-      if (service.uuid.toString() == SERVICE_UUID) {
-        // Encontramos o serviço, agora procuramos as 3 características
-        for (BluetoothCharacteristic characteristic in service.characteristics) {
-          if (characteristic.uuid.toString() == CHARACTERISTIC_UUID_S1) {
-            _sensor1Char = characteristic;
-          } else if (characteristic.uuid.toString() == CHARACTERISTIC_UUID_S2) {
-            _sensor2Char = characteristic;
-          } else if (characteristic.uuid.toString() == CHARACTERISTIC_UUID_S3) {
-            _sensor3Char = characteristic;
+          if (uuid == charUuidS1) { // Frente
+            _subS1 = c.lastValueStream.listen((val) {
+              String s = String.fromCharCodes(val);
+              _processarSensor(s, (v) => setState(() => txtFrente = v), histFrente);
+            });
+          }
+          else if (uuid == charUuidS2) { // Esquerda
+            _subS2 = c.lastValueStream.listen((val) {
+              String s = String.fromCharCodes(val);
+              _processarSensor(s, (v) => setState(() => txtEsq = v), histEsq);
+            });
+          }
+          else if (uuid == charUuidS3) { // Direita
+            _subS3 = c.lastValueStream.listen((val) {
+              String s = String.fromCharCodes(val);
+              _processarSensor(s, (v) => setState(() => txtDir = v), histDir);
+            });
           }
         }
-        
-        // Se encontramos todas, vamos nos inscrever nelas
-        if (_sensor1Char != null && _sensor2Char != null && _sensor3Char != null) {
-          setState(() {
-            _statusMessage = "Sensores encontrados! Inscrevendo...";
-          });
-          _subscribeToNotifications(); // O passo final
-        }
-        return; 
       }
     }
-    setState(() {
-      _statusMessage = "Serviço de sensores não encontrado.";
-    });
   }
 
-  // 4. Se inscreve para receber as Notificações
-  void _subscribeToNotifications() async {
-    if (_sensor1Char == null || _sensor2Char == null || _sensor3Char == null) return;
-
-    // Limpa assinaturas antigas
-    await _s1Subscription?.cancel();
-    await _s2Subscription?.cancel();
-    await _s3Subscription?.cancel();
-
-    // Ativa o "Notify" para cada característica
-    await _sensor1Char!.setNotifyValue(true);
-    await _sensor2Char!.setNotifyValue(true);
-    await _sensor3Char!.setNotifyValue(true);
-
-    // Ouve o stream de dados do Sensor 1
-    _s1Subscription = _sensor1Char!.lastValueStream.listen((value) {
-      // 'value' é uma List<int> (bytes). Convertemos para String.
-      String distancia = String.fromCharCodes(value);
-      setState(() {
-        _distancia1 = distancia;
-      });
-    });
-
-    // Ouve o stream de dados do Sensor 2
-    _s2Subscription = _sensor2Char!.lastValueStream.listen((value) {
-      String distancia = String.fromCharCodes(value);
-      setState(() {
-        _distancia2 = distancia;
-      });
-    });
-
-    // Ouve o stream de dados do Sensor 3
-    _s3Subscription = _sensor3Char!.lastValueStream.listen((value) {
-      String distancia = String.fromCharCodes(value);
-      setState(() {
-        _distancia3 = distancia;
-      });
-    });
-
-    setState(() {
-      _statusMessage = "Recebendo dados dos sensores!";
-    });
+  void _disconnect() async {
+    await _device?.disconnect();
+    if (mounted) setState(() => _isConnected = false);
   }
 
-  // ----- Interface Gráfica (UI) -----
+  // =================================================================
+  // --- INTERFACE GRÁFICA (ALTO CONTRASTE) ---
+  // =================================================================
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text("Beyond Horizon - Sensores ESP32"),
+        title: Text("Navegação Assistiva", style: GoogleFonts.orbitron(fontWeight: FontWeight.bold)),
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        centerTitle: true,
       ),
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            Text(
-              _statusMessage,
-              style: TextStyle(fontSize: 16, color: Colors.grey[600]),
+      body: Column(
+        children: [
+          // Barra de Status
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12),
+            color: _isConnected ? Colors.green[900] : Colors.red[900],
+            child: Text(
+              _status.toUpperCase(),
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
             ),
-            SizedBox(height: 30),
-            _buildSensorDisplay("Sensor 1", _distancia1),
-            SizedBox(height: 20),
-            _buildSensorDisplay("Sensor 2", _distancia2),
-            SizedBox(height: 20),
-            _buildSensorDisplay("Sensor 3", _distancia3),
-            SizedBox(height: 40),
-            ElevatedButton(
-              child: Text(_isConnected ? "Reconectar" : "Conectar"),
-              onPressed: () {
-                if(_esp32Device != null) {
-                  _esp32Device!.disconnect();
-                }
-                _startScan();
-              },
-            )
-          ],
-        ),
+          ),
+
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                children: [
+                  _buildCard("ESQUERDA", txtEsq, Colors.purpleAccent),
+                  _buildCard("FRENTE", txtFrente, Colors.cyanAccent, isMain: true),
+                  _buildCard("DIREITA", txtDir, Colors.orangeAccent),
+                ],
+              ),
+            ),
+          ),
+
+          // Botão Grande
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 0, 20, 30),
+            child: SizedBox(
+              width: double.infinity,
+              height: 65,
+              child: ElevatedButton.icon(
+                icon: Icon(_isConnected ? Icons.stop_circle : Icons.play_circle, size: 30),
+                label: Text(
+                  _isConnected ? "PARAR SISTEMA" : "INICIAR SISTEMA",
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 20),
+                ),
+                onPressed: _isScanning ? null : (_isConnected ? _disconnect : _startScan),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: _isConnected ? Colors.red[800] : Colors.yellowAccent,
+                  foregroundColor: _isConnected ? Colors.white : Colors.black, // Contraste texto/fundo
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
 
-  // Widget para mostrar a distância
-  Widget _buildSensorDisplay(String nomeSensor, String distancia) {
-    return Column(
-      children: [
-        Text(nomeSensor, style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-        Text(
-          "$distancia cm",
-          style: TextStyle(fontSize: 48, color: Colors.blue),
-        ),
-      ],
+  Widget _buildCard(String label, String value, Color color, {bool isMain = false}) {
+    // Formata o valor para a tela (se for 400 mostra >4m)
+    String display = (value == "400.0" || value == "400") ? "> 4m" : value;
+
+    return Container(
+      width: double.infinity,
+      padding: EdgeInsets.symmetric(vertical: isMain ? 30 : 20, horizontal: 20),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E1E1E), // Cinza muito escuro
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: color, width: isMain ? 3 : 1), // Borda colorida para identificação
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: const TextStyle(color: Colors.white70, fontSize: 18, fontWeight: FontWeight.bold)),
+          Row(
+            children: [
+              Text(
+                display,
+                style: GoogleFonts.orbitron(
+                  fontSize: isMain ? 48 : 36,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
+              ),
+              if (display != "> 4m" && display != "--")
+                const Padding(
+                  padding: EdgeInsets.only(left: 8.0, top: 10),
+                  child: Text("cm", style: TextStyle(color: Colors.white54, fontSize: 16)),
+                ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 }
