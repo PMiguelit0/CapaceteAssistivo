@@ -1,5 +1,6 @@
 import 'dart:async';
-import 'dart:collection'; // Import para filas (Queue)
+import 'dart:collection';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -18,7 +19,7 @@ class MyApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'Assistente Visual',
       theme: ThemeData.dark().copyWith(
-        scaffoldBackgroundColor: const Color(0xFF000000), // Preto absoluto
+        scaffoldBackgroundColor: const Color(0xFF000000),
         primaryColor: Colors.blueAccent,
         textTheme: ThemeData.dark().textTheme,
       ),
@@ -35,33 +36,40 @@ class SensorDashboard extends StatefulWidget {
 }
 
 class _SensorDashboardState extends State<SensorDashboard> {
-  // --- CONFIGURAÇÃO BLE (UUIDs do ESP32) ---
+  // --- CONFIGURAÇÃO BLUETOOTH (UUIDs do ESP32) ---
   final String targetDeviceName = "ESP32_Capacete";
   final String serviceUuid = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
 
   final String charUuidS1 = "beb5483e-36e1-4688-b7f5-ea07361b26a8"; // FRENTE
   final String charUuidS2 = "1c95d5e5-0466-4aa8-b8d9-e31d0ebf8453"; // ESQUERDA
   final String charUuidS3 = "aa2b5a6c-486a-4b68-b118-a61f5c6b6d3b"; // DIREITA
+  
+  // --- UUID do Acelerômetro ---
+  final String charUuidAccel = "e9eaadd6-25f8-470c-b59e-4a608fced746"; 
 
   // --- VARIÁVEIS DE CONTROLE ---
   BluetoothDevice? _device;
   StreamSubscription? _scanSub;
-  StreamSubscription? _subS1, _subS2, _subS3;
+  StreamSubscription? _subS1, _subS2, _subS3, _subAccel; 
 
   bool _isConnected = false;
   bool _isScanning = false;
   String _status = "Toque em CONECTAR";
+
+  // --- CONTROLE DE POSTURA ---
+  bool _sistemaPausadoPorPostura = false;
+  double _anguloVerticalCabeca = 0.0;     
 
   // Valores de Tela
   String txtFrente = "--";
   String txtEsq = "--";
   String txtDir = "--";
 
-  // --- BUFFER DE MEMÓRIA (Janela Deslizante) ---
+  // --- BUFFER DE MEMÓRIA ---
   final int tamanhoBuffer = 10;
-  List<double> histFrente = [];
-  List<double> histEsq = [];
-  List<double> histDir = [];
+  Queue<double> histFrente = Queue<double>(); 
+  Queue<double> histEsq = Queue<double>();
+  Queue<double> histDir = Queue<double>();
 
   // --- SISTEMA DE ÁUDIO ---
   final FlutterTts flutterTts = FlutterTts();
@@ -71,7 +79,7 @@ class _SensorDashboardState extends State<SensorDashboard> {
   bool _processandoAudio = false;
   bool _falandoAlgoDeAltaPrioridade = false;
 
-  // Spam Filter
+  // Filtro de SPAM
   String _ultimaMensagemDita = "";
   DateTime _tempoUltimaFala = DateTime.now();
 
@@ -85,7 +93,7 @@ class _SensorDashboardState extends State<SensorDashboard> {
   @override
   void dispose() {
     _scanSub?.cancel();
-    _subS1?.cancel(); _subS2?.cancel(); _subS3?.cancel();
+    _subS1?.cancel(); _subS2?.cancel(); _subS3?.cancel(); _subAccel?.cancel();
     _device?.disconnect();
     flutterTts.stop();
     super.dispose();
@@ -107,7 +115,7 @@ class _SensorDashboardState extends State<SensorDashboard> {
   // =================================================================
 
   void _adicionarFilaVoz(String mensagem, {bool ehAltaPrioridade = false}) async {
-    // Filtro: Não repete a mesma frase em menos de 3 segundos
+    // Se for msg repetida em curto prazo, ignora
     if (_ultimaMensagemDita == mensagem && DateTime.now().difference(_tempoUltimaFala).inSeconds < 3) {
       return;
     }
@@ -116,12 +124,15 @@ class _SensorDashboardState extends State<SensorDashboard> {
       if (!_filaAltaPrioridade.contains(mensagem)) {
         _filaAltaPrioridade.add(mensagem);
         if (_processandoAudio && !_falandoAlgoDeAltaPrioridade) {
-          await flutterTts.stop(); // Interrompe fala normal para emergência
+          await flutterTts.stop(); 
         }
       }
     } else {
-      if (!_filaNormalPrioridade.contains(mensagem) && !_filaAltaPrioridade.contains(mensagem)) {
-        _filaNormalPrioridade.add(mensagem);
+      // Mensagens normais só entram se o sistema NÃO estiver pausado pela postura
+      if (!_sistemaPausadoPorPostura) {
+        if (!_filaNormalPrioridade.contains(mensagem) && !_filaAltaPrioridade.contains(mensagem)) {
+          _filaNormalPrioridade.add(mensagem);
+        }
       }
     }
 
@@ -159,73 +170,107 @@ class _SensorDashboardState extends State<SensorDashboard> {
   // --- MATEMÁTICA E HELPERS ---
   // =================================================================
 
-  double _calcularMedia(List<double> lista) {
-    if (lista.isEmpty) return 0.0;
-    double soma = lista.reduce((a, b) => a + b);
-    return soma / lista.length;
+  double _calcularMedia(Queue<double> fila) {
+    if (fila.isEmpty) return 0.0;
+    double soma = fila.reduce((a, b) => a + b);
+    return soma / fila.length;
   }
 
-  void _adicionarAoHistorico(List<double> lista, double valor) {
-    lista.add(valor);
-    if (lista.length > tamanhoBuffer) lista.removeAt(0);
-  }
-
-  // Retorna diferença: Positivo = APROXIMANDO, Negativo = AFASTANDO
-  double _calcularTendencia(List<double> historico) {
-    if (historico.length < 5) return 0.0;
-    double mediaAntiga = _calcularMedia(historico.sublist(0, 5));
-    double mediaRecente = _calcularMedia(historico.sublist(historico.length - 5));
-    return mediaAntiga - mediaRecente;
+  void _adicionarAoHistorico(Queue<double> fila, double valor) {
+    if (valor < 2 || valor > 400) return;
+    fila.add(valor);
+    if (fila.length > tamanhoBuffer) fila.removeFirst();
   }
 
   // =================================================================
-  // --- LÓGICA DE ANÁLISE SEPARADA ---
+  // --- LÓGICA DO ACELERÔMETRO (NOVO) ---
   // =================================================================
 
-  void _analisarFrente(List<double> buffer) {
+  void _receberDadosAcelerometro(String valorRaw) {
+    try {
+      // Espera receber string formato: "x,y,z" (ex: "0.20,-0.10,9.80")
+      List<String> partes = valorRaw.split(',');
+      if (partes.length < 3) return;
+
+      double ax = double.parse(partes[0]);
+      double ay = double.parse(partes[1]);
+      double az = double.parse(partes[2]);
+
+      // Cálculo do Pitch (Inclinação)
+      // Ajuste ax, ay, az na fórmula dependendo da montagem física do sensor
+      double pitchRad = atan(ax / sqrt(pow(ay, 2) + pow(az, 2)));
+      double pitchGraus = pitchRad * (180 / pi);
+
+      // Suavização (Média Ponderada) para evitar oscilação
+      _anguloVerticalCabeca = (_anguloVerticalCabeca * 0.8) + (pitchGraus * 0.2);
+
+      // Lógica de Histerese (Zona Morta)
+      // Pausa se inclinar mais que 30 graus (olhando pro chão)
+      if (!_sistemaPausadoPorPostura && _anguloVerticalCabeca.abs() > 30) {
+        setState(() {
+          _sistemaPausadoPorPostura = true;
+          // Limpa buffers para evitar dados velhos quando voltar
+          histFrente.clear(); histEsq.clear(); histDir.clear();
+          txtFrente = "--"; txtEsq = "--"; txtDir = "--";
+        });
+        _adicionarFilaVoz("Por favor, olhe para frente.", ehAltaPrioridade: true);
+      }
+      // Retoma se voltar para menos de 20 graus
+      else if (_sistemaPausadoPorPostura && _anguloVerticalCabeca.abs() < 20) {
+        setState(() {
+          _sistemaPausadoPorPostura = false;
+        });
+        _adicionarFilaVoz("Leitura retomada.");
+      }
+
+    } catch (e) {
+      // Erro de parse ignorado
+    }
+  }
+
+  // =================================================================
+  // --- LÓGICA DOS SENSORES ---
+  // =================================================================
+
+  void _analisarFrente(Queue<double> buffer) {
+
     if (buffer.length < tamanhoBuffer) return;
+    if (_sistemaPausadoPorPostura) return;
+    
+    double mediaRecente = _calcularMedia(Queue.from(buffer.skip(buffer.length - 5)));
 
-    double mediaAtual = _calcularMedia(buffer);
-    double tendencia = _calcularTendencia(buffer);
-
-    // 1. EMERGÊNCIA (PARE!)
-    if (mediaAtual < 60) {
+    if (mediaRecente < 50) {
       _adicionarFilaVoz("Pare! Frente.", ehAltaPrioridade: true);
       return;
     }
 
-    // 2. ATENÇÃO RÁPIDA (Alguém entrou na frente)
-    if (tendencia > 40 && mediaAtual < 180) {
-      _adicionarFilaVoz("Atenção frente.", ehAltaPrioridade: true);
-      return;
-    }
   }
 
-  void _analisarLateral(List<double> buffer, String lado) {
+ void _analisarLateral(Queue<double> buffer, String lado) {
     if (buffer.length < tamanhoBuffer) return;
+    
+    if (_sistemaPausadoPorPostura) return;
 
-    double mediaAtual = _calcularMedia(buffer);
-    double tendencia = _calcularTendencia(buffer);
+    double mediaAntiga = _calcularMedia(Queue.from(buffer.take(5)));
+    double mediaRecente = _calcularMedia(Queue.from(buffer.skip(buffer.length - 5)));
 
-    // 1. APROXIMAÇÃO PERIGOSA (Andando torto)
-    if (tendencia > 30 && mediaAtual < 60) {
+    if ((mediaAntiga - mediaRecente) > 30 && mediaRecente < 60) {
       _adicionarFilaVoz("Cuidado $lado.", ehAltaPrioridade: true);
       return;
     }
 
-    // 2. DETECÇÃO DE ABERTURA (Portas)
-    // Estava PERTO (<80) e ficou LONGE (>150)
-    double mediaAntiga = _calcularMedia(buffer.sublist(0, 5));
-    if (mediaAntiga < 80 && mediaAtual > 150) {
+    if (mediaAntiga < 80 && mediaRecente > 150) {
       _adicionarFilaVoz("Abertura à $lado.");
     }
   }
 
   // =================================================================
-  // --- RECEBEDORES DE DADOS (CALLBACKS ESPECÍFICOS) ---
+  // --- RECEBEDORES DE DADOS (CALLBACKS) ---
   // =================================================================
 
   void _receberDadosFrente(String valorRaw) {
+    if (_sistemaPausadoPorPostura) return;
+
     try {
       double? valor = double.tryParse(valorRaw);
       if (valor == null) return;
@@ -234,13 +279,13 @@ class _SensorDashboardState extends State<SensorDashboard> {
       double media = _calcularMedia(histFrente);
 
       if (mounted) setState(() => txtFrente = media.toStringAsFixed(0));
-
-      // Chama análise específica
       _analisarFrente(histFrente);
-    } catch (e) { /* Ignora erro de parse */ }
+    } catch (e) { }
   }
 
   void _receberDadosEsquerda(String valorRaw) {
+    if (_sistemaPausadoPorPostura) return;
+
     try {
       double? valor = double.tryParse(valorRaw);
       if (valor == null) return;
@@ -249,13 +294,13 @@ class _SensorDashboardState extends State<SensorDashboard> {
       double media = _calcularMedia(histEsq);
 
       if (mounted) setState(() => txtEsq = media.toStringAsFixed(0));
-
-      // Chama análise específica
       _analisarLateral(histEsq, "esquerda");
     } catch (e) {}
   }
 
   void _receberDadosDireita(String valorRaw) {
+    if (_sistemaPausadoPorPostura) return;
+
     try {
       double? valor = double.tryParse(valorRaw);
       if (valor == null) return;
@@ -264,8 +309,6 @@ class _SensorDashboardState extends State<SensorDashboard> {
       double media = _calcularMedia(histDir);
 
       if (mounted) setState(() => txtDir = media.toStringAsFixed(0));
-
-      // Chama análise específica
       _analisarLateral(histDir, "direita");
     } catch (e) {}
   }
@@ -332,18 +375,16 @@ class _SensorDashboardState extends State<SensorDashboard> {
           String uuid = c.uuid.toString();
           await c.setNotifyValue(true);
 
-          // AQUI ESTÁ A MUDANÇA: Cada UUID aponta para sua função específica
           if (uuid == charUuidS1) { // FRENTE
-            _subS1 = c.lastValueStream.listen((val) {
-              _receberDadosFrente(String.fromCharCodes(val));
-            });
+            _subS1 = c.lastValueStream.listen((val) => _receberDadosFrente(String.fromCharCodes(val)));
           } else if (uuid == charUuidS2) { // ESQUERDA
-            _subS2 = c.lastValueStream.listen((val) {
-              _receberDadosEsquerda(String.fromCharCodes(val));
-            });
+            _subS2 = c.lastValueStream.listen((val) => _receberDadosEsquerda(String.fromCharCodes(val)));
           } else if (uuid == charUuidS3) { // DIREITA
-            _subS3 = c.lastValueStream.listen((val) {
-              _receberDadosDireita(String.fromCharCodes(val));
+            _subS3 = c.lastValueStream.listen((val) => _receberDadosDireita(String.fromCharCodes(val)));
+          } 
+          else if (uuid == charUuidAccel) {
+            _subAccel = c.lastValueStream.listen((val) {
+               _receberDadosAcelerometro(String.fromCharCodes(val));
             });
           }
         }
@@ -357,7 +398,7 @@ class _SensorDashboardState extends State<SensorDashboard> {
   }
 
   // =================================================================
-  // --- UI (Mantida Igual) ---
+  // --- UI ---
   // =================================================================
 
   @override
@@ -371,29 +412,37 @@ class _SensorDashboardState extends State<SensorDashboard> {
       ),
       body: Column(
         children: [
+          // --- BARRA DE STATUS ---
           Container(
             width: double.infinity,
             padding: const EdgeInsets.all(12),
-            color: _isConnected ? Colors.green[900] : Colors.red[900],
+            // Muda a cor se estiver Pausado por Postura
+            color: _sistemaPausadoPorPostura 
+                ? Colors.orange[900] // Laranja = Alerta Postura
+                : (_isConnected ? Colors.green[900] : Colors.red[900]),
             child: Text(
-              _status.toUpperCase(),
+              _sistemaPausadoPorPostura 
+                  ? "POSTURA INCORRETA (PAUSADO)" 
+                  : _status.toUpperCase(),
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
             ),
           ),
+          
           Expanded(
             child: Padding(
               padding: const EdgeInsets.all(16.0),
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                 children: [
-                  _buildCard("ESQUERDA", txtEsq, Colors.purpleAccent),
-                  _buildCard("FRENTE", txtFrente, Colors.cyanAccent, isMain: true),
-                  _buildCard("DIREITA", txtDir, Colors.orangeAccent),
+                  _buildCard("ESQUERDA", _sistemaPausadoPorPostura ? "--" : txtEsq, Colors.purpleAccent),
+                  _buildCard("FRENTE", _sistemaPausadoPorPostura ? "--" : txtFrente, Colors.cyanAccent, isMain: true),
+                  _buildCard("DIREITA", _sistemaPausadoPorPostura ? "--" : txtDir, Colors.orangeAccent),
                 ],
               ),
             ),
           ),
+          
           Padding(
             padding: const EdgeInsets.fromLTRB(20, 0, 20, 30),
             child: SizedBox(
@@ -421,33 +470,38 @@ class _SensorDashboardState extends State<SensorDashboard> {
 
   Widget _buildCard(String label, String value, Color color, {bool isMain = false}) {
     String display = (value == "400" || value == "400.0") ? "> 4m" : value;
+    
+    // Efeito visual de desabilitado se estiver pausado
+    Color finalColor = _sistemaPausadoPorPostura ? Colors.grey : color;
+    Color textColor = _sistemaPausadoPorPostura ? Colors.white38 : Colors.white;
+
     return Container(
       width: double.infinity,
       padding: EdgeInsets.symmetric(vertical: isMain ? 30 : 20, horizontal: 20),
       decoration: BoxDecoration(
         color: const Color(0xFF1E1E1E),
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: color, width: isMain ? 3 : 1),
+        border: Border.all(color: finalColor, width: isMain ? 3 : 1),
       ),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text(label, style: const TextStyle(color: Colors.white70, fontSize: 18, fontWeight: FontWeight.bold)),
+          Text(label, style: TextStyle(color: textColor.withOpacity(0.7), fontSize: 18, fontWeight: FontWeight.bold)),
           Row(
             children: [
               Text(
                 display,
-                style: const TextStyle(
+                style: TextStyle(
                     fontSize: 36,
                     fontWeight: FontWeight.bold,
-                    color: Colors.white,
+                    color: textColor,
                     fontFamily: 'Monospace'
                 ),
               ),
               if (display != "> 4m" && display != "--")
-                const Padding(
-                  padding: EdgeInsets.only(left: 8.0, top: 10),
-                  child: Text("cm", style: TextStyle(color: Colors.white54, fontSize: 16)),
+                Padding(
+                  padding: const EdgeInsets.only(left: 8.0, top: 10),
+                  child: Text("cm", style: TextStyle(color: textColor.withOpacity(0.5), fontSize: 16)),
                 ),
             ],
           ),
