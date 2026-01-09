@@ -59,6 +59,7 @@ class _SensorDashboardState extends State<SensorDashboard> {
   // --- CONTROLE DE POSTURA ---
   bool _sistemaPausadoPorPostura = false;
   double _anguloVerticalCabeca = 0.0;     
+  double _anguloLateralCabeca = 0.0; 
 
   // Valores de Tela
   String txtFrente = "--";
@@ -82,6 +83,13 @@ class _SensorDashboardState extends State<SensorDashboard> {
   // Filtro de SPAM
   String _ultimaMensagemDita = "";
   DateTime _tempoUltimaFala = DateTime.now();
+
+  final Map<String, DateTime> _cooldowns = {}; 
+  
+  // Define tempos de silêncio para tipos de mensagem (em segundos)
+  final int _cooldownEmergencia = 4; // Mensagens de pare/perigo imediato
+  final int _cooldownAviso = 8;      // Avisos de lateral/abertura
+  final int _cooldownPostura = 9;    // Avisos de postura (para não ser chato)
 
   @override
   void initState() {
@@ -114,27 +122,49 @@ class _SensorDashboardState extends State<SensorDashboard> {
   // --- GERENCIADOR DE ÁUDIO ---
   // =================================================================
 
-  void _adicionarFilaVoz(String mensagem, {bool ehAltaPrioridade = false}) async {
-    // Se for msg repetida em curto prazo, ignora
-    if (_ultimaMensagemDita == mensagem && DateTime.now().difference(_tempoUltimaFala).inSeconds < 3) {
-      return;
+  void _adicionarFilaVoz(String mensagem, {bool ehAltaPrioridade = false}) {
+    DateTime agora = DateTime.now();
+    
+    // 1. Verifica Cooldown (Se já falou essa mesma frase recentemente)
+    if (_cooldowns.containsKey(mensagem)) {
+      int tempoEspera = ehAltaPrioridade ? _cooldownEmergencia : _cooldownAviso;
+      
+      // Se for mensagem de postura, aumentamos o tempo para não ficar irritante
+      if (mensagem.contains("cabeça") || mensagem.contains("postura")) {
+        tempoEspera = _cooldownPostura;
+      }
+
+      if (agora.difference(_cooldowns[mensagem]!).inSeconds < tempoEspera) {
+        return; // Sai da função, ignora o pedido de fala
+      }
     }
 
+    // 2. Lógica de Limpeza de Fila (Anti-Poluição)
     if (ehAltaPrioridade) {
+      // Se é urgente, limpa a fila de coisas banais que ainda não foram ditas
+      _filaNormalPrioridade.clear(); 
+      
+      // Evita duplicação na fila de alta prioridade
       if (!_filaAltaPrioridade.contains(mensagem)) {
         _filaAltaPrioridade.add(mensagem);
+        // Se estiver falando algo banal agora, para imediatamente
         if (_processandoAudio && !_falandoAlgoDeAltaPrioridade) {
-          await flutterTts.stop(); 
+          flutterTts.stop(); 
         }
       }
     } else {
-      // Mensagens normais só entram se o sistema NÃO estiver pausado pela postura
+      // Mensagens normais (só adiciona se não estiver pausado e não for duplicada)
       if (!_sistemaPausadoPorPostura) {
         if (!_filaNormalPrioridade.contains(mensagem) && !_filaAltaPrioridade.contains(mensagem)) {
-          _filaNormalPrioridade.add(mensagem);
+           // Limita o tamanho da fila normal para não acumular "histórico"
+           if (_filaNormalPrioridade.length > 2) _filaNormalPrioridade.removeFirst();
+           _filaNormalPrioridade.add(mensagem);
         }
       }
     }
+
+    // 3. Atualiza o timestamp dessa mensagem específica
+    _cooldowns[mensagem] = agora;
 
     if (!_processandoAudio) _processarFilasDeAudio();
   }
@@ -187,80 +217,120 @@ class _SensorDashboardState extends State<SensorDashboard> {
   // =================================================================
 
   void _receberDadosAcelerometro(String valorRaw) {
-    try {
-      // Espera receber string formato: "x,y,z" (ex: "0.20,-0.10,9.80")
-      List<String> partes = valorRaw.split(',');
-      if (partes.length < 3) return;
+  try {
+    List<String> partes = valorRaw.split(',');
+    if (partes.length < 3) return;
 
-      double ax = double.parse(partes[0]);
-      double ay = double.parse(partes[1]);
-      double az = double.parse(partes[2]);
+    double ax = double.parse(partes[0]);
+    double ay = double.parse(partes[1]);
+    double az = double.parse(partes[2]);
 
-      // Cálculo do Pitch (Inclinação)
-      // Ajuste ax, ay, az na fórmula dependendo da montagem física do sensor
-      double pitchRad = atan(ax / sqrt(pow(ay, 2) + pow(az, 2)));
-      double pitchGraus = pitchRad * (180 / pi);
+    // --- CÁLCULOS TRIGONOMÉTRICOS ---
+    
+    // 1. PITCH (Vertical - Olhar chão/céu)
+    // Rotação em torno do eixo Y (ou X, dependendo da montagem)
+    double pitchRad = atan(ax / sqrt(pow(ay, 2) + pow(az, 2)));
+    double pitchGraus = pitchRad * (180 / pi);
 
-      // Suavização (Média Ponderada) para evitar oscilação
-      _anguloVerticalCabeca = (_anguloVerticalCabeca * 0.8) + (pitchGraus * 0.2);
+    // 2. ROLL (Lateral - Orelha no ombro)
+    // Rotação em torno do eixo X. Note que invertemos: agora é AY dividido por AX+AZ
+    double rollRad = atan(ay / sqrt(pow(ax, 2) + pow(az, 2)));
+    double rollGraus = rollRad * (180 / pi);
 
-      // Lógica de Histerese (Zona Morta)
-      // Pausa se inclinar mais que 30 graus (olhando pro chão)
-      if (!_sistemaPausadoPorPostura && _anguloVerticalCabeca.abs() > 30) {
-        setState(() {
-          _sistemaPausadoPorPostura = true;
-          // Limpa buffers para evitar dados velhos quando voltar
-          histFrente.clear(); histEsq.clear(); histDir.clear();
-          txtFrente = "--"; txtEsq = "--"; txtDir = "--";
-        });
-        _adicionarFilaVoz("Por favor, olhe para frente.", ehAltaPrioridade: true);
+    // --- SUAVIZAÇÃO (EMA) ---
+    // Aplica filtro para o número não pular loucamente
+    _anguloVerticalCabeca = (_anguloVerticalCabeca * 0.8) + (pitchGraus * 0.2);
+    _anguloLateralCabeca = (_anguloLateralCabeca * 0.8) + (rollGraus * 0.2);
+
+    // --- LÓGICA DE SEGURANÇA ---
+    
+    // Definindo limites
+    bool olhandoBaixo = _anguloVerticalCabeca.abs() > 45; // Cabeça muito baixa
+    bool cabecaTorta = _anguloLateralCabeca.abs() > 40;   // Cabeça inclinada > 40° para os lados
+    
+    bool posturaRuim = olhandoBaixo || cabecaTorta;
+
+    // A. ENTRAR EM PAUSA (Se qualquer coisa estiver errada)
+    if (!_sistemaPausadoPorPostura && posturaRuim) {
+      setState(() {
+        _sistemaPausadoPorPostura = true;
+        // Limpa buffers
+        histFrente.clear(); histEsq.clear(); histDir.clear();
+        txtFrente = "--"; txtEsq = "--"; txtDir = "--";
+      });
+
+      // Feedback específico
+      if (olhandoBaixo) {
+        _adicionarFilaVoz("Levante a cabeça.", ehAltaPrioridade: true);
+      } else {
+        _adicionarFilaVoz("Ajeite a cabeça.", ehAltaPrioridade: true);
       }
-      // Retoma se voltar para menos de 20 graus
-      else if (_sistemaPausadoPorPostura && _anguloVerticalCabeca.abs() < 20) {
+    }
+    
+    // B. SAIR DA PAUSA (Só sai se TUDO estiver certo)
+    // Histerese: Exige que volte para < 30 (vertical) e < 30 (lateral) para garantir estabilidade
+    else if (_sistemaPausadoPorPostura) {
+      bool verticalSeguro = _anguloVerticalCabeca.abs() < 30;
+      bool lateralSeguro = _anguloLateralCabeca.abs() < 30;
+
+      if (verticalSeguro && lateralSeguro) {
         setState(() {
           _sistemaPausadoPorPostura = false;
         });
         _adicionarFilaVoz("Leitura retomada.");
       }
-
-    } catch (e) {
-      // Erro de parse ignorado
     }
+
+  } catch (e) {
+    // Ignora erro de parse
   }
+}
 
   // =================================================================
   // --- LÓGICA DOS SENSORES ---
   // =================================================================
 
   void _analisarFrente(Queue<double> buffer) {
-
     if (buffer.length < tamanhoBuffer) return;
     if (_sistemaPausadoPorPostura) return;
     
+    // Pega a média dos últimos 3 valores apenas (resposta mais rápida)
     double mediaRecente = _calcularMedia(Queue.from(buffer.skip(buffer.length - 5)));
 
-    if (mediaRecente < 50) {
-      _adicionarFilaVoz("Pare! Frente.", ehAltaPrioridade: true);
+    // DISTÂNCIA CRÍTICA (Pare agora)
+    if (mediaRecente < 40) { 
+      // Alta prioridade, cooldown curto (definido na função anterior)
+      _adicionarFilaVoz("Pare!", ehAltaPrioridade: true); 
       return;
     }
-
+    
+    // DISTÂNCIA DE ATENÇÃO (Avisar obstáculo próximo)
+    // Usamos um range (entre 40 e 80) para não falar se estiver longe
+    if (mediaRecente >= 40 && mediaRecente < 80) {
+      _adicionarFilaVoz("Frente.", ehAltaPrioridade: false); 
+    }
   }
 
  void _analisarLateral(Queue<double> buffer, String lado) {
     if (buffer.length < tamanhoBuffer) return;
-    
     if (_sistemaPausadoPorPostura) return;
 
     double mediaAntiga = _calcularMedia(Queue.from(buffer.take(5)));
     double mediaRecente = _calcularMedia(Queue.from(buffer.skip(buffer.length - 5)));
+    double diferenca = mediaAntiga - mediaRecente;
 
-    if ((mediaAntiga - mediaRecente) > 30 && mediaRecente < 60) {
+    // Detecta aproximação brusca (parede chegando)
+    // Aumentei a diferença exigida para 40cm para evitar disparos com o balanço da cabeça
+    if (diferenca > 40 && mediaRecente < 60) {
       _adicionarFilaVoz("Cuidado $lado.", ehAltaPrioridade: true);
       return;
     }
 
-    if (mediaAntiga < 80 && mediaRecente > 150) {
-      _adicionarFilaVoz("Abertura à $lado.");
+    // Detecta abertura (porta/corredor)
+    // Aumentei a exigência: tem que passar de <80 para >180
+    if (mediaAntiga < 80 && mediaRecente > 180) {
+      // Mensagem curta é melhor
+      _adicionarFilaVoz("Vão à $lado."); 
     }
   }
 
