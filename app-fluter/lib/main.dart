@@ -43,14 +43,14 @@ class _SensorDashboardState extends State<SensorDashboard> {
   final String charUuidS1 = "beb5483e-36e1-4688-b7f5-ea07361b26a8"; // FRENTE
   final String charUuidS2 = "1c95d5e5-0466-4aa8-b8d9-e31d0ebf8453"; // ESQUERDA
   final String charUuidS3 = "aa2b5a6c-486a-4b68-b118-a61f5c6b6d3b"; // DIREITA
-  
+
   // --- UUID do Acelerômetro ---
-  final String charUuidAccel = "e9eaadd6-25f8-470c-b59e-4a608fced746"; 
+  final String charUuidAccel = "e9eaadd6-25f8-470c-b59e-4a608fced746";
 
   // --- VARIÁVEIS DE CONTROLE ---
   BluetoothDevice? _device;
   StreamSubscription? _scanSub;
-  StreamSubscription? _subS1, _subS2, _subS3, _subAccel; 
+  StreamSubscription? _subS1, _subS2, _subS3, _subAccel;
 
   bool _isConnected = false;
   bool _isScanning = false;
@@ -58,8 +58,8 @@ class _SensorDashboardState extends State<SensorDashboard> {
 
   // --- CONTROLE DE POSTURA ---
   bool _sistemaPausadoPorPostura = false;
-  double _anguloVerticalCabeca = 0.0;     
-  double _anguloLateralCabeca = 0.0; 
+  // double _anguloVerticalCabeca = 0.0; // variavel nao usada
+  // double _anguloLateralCabeca = 0.0; // variavel nao usada
 
   // Valores de Tela
   String txtFrente = "--";
@@ -68,7 +68,7 @@ class _SensorDashboardState extends State<SensorDashboard> {
 
   // --- BUFFER DE MEMÓRIA ---
   final int tamanhoBuffer = 10;
-  Queue<double> histFrente = Queue<double>(); 
+  Queue<double> histFrente = Queue<double>();
   Queue<double> histEsq = Queue<double>();
   Queue<double> histDir = Queue<double>();
 
@@ -94,14 +94,21 @@ class _SensorDashboardState extends State<SensorDashboard> {
   @override
   void dispose() {
     _scanSub?.cancel();
-    _subS1?.cancel(); _subS2?.cancel(); _subS3?.cancel(); _subAccel?.cancel();
+    _subS1?.cancel();
+    _subS2?.cancel();
+    _subS3?.cancel();
+    _subAccel?.cancel();
     _device?.disconnect();
     flutterTts.stop();
     super.dispose();
   }
 
   Future<void> _checkPermissions() async {
-    await [Permission.bluetoothScan, Permission.bluetoothConnect, Permission.location].request();
+    await [
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.location,
+    ].request();
   }
 
   Future<void> _initTTS() async {
@@ -115,9 +122,13 @@ class _SensorDashboardState extends State<SensorDashboard> {
   // --- GERENCIADOR DE ÁUDIO ---
   // =================================================================
 
-  void _adicionarFilaVoz(String mensagem, {bool ehAltaPrioridade = false}) async {
+  void _adicionarFilaVoz(
+    String mensagem, {
+    bool ehAltaPrioridade = false,
+  }) async {
     // Se for msg repetida em curto prazo, ignora
-    if (_ultimaMensagemDita == mensagem && DateTime.now().difference(_tempoUltimaFala).inSeconds < 3) {
+    if (_ultimaMensagemDita == mensagem &&
+        DateTime.now().difference(_tempoUltimaFala).inSeconds < 3) {
       return;
     }
 
@@ -125,13 +136,14 @@ class _SensorDashboardState extends State<SensorDashboard> {
       if (!_filaAltaPrioridade.contains(mensagem)) {
         _filaAltaPrioridade.add(mensagem);
         if (_processandoAudio && !_falandoAlgoDeAltaPrioridade) {
-          await flutterTts.stop(); 
+          await flutterTts.stop();
         }
       }
     } else {
       // Mensagens normais só entram se o sistema NÃO estiver pausado pela postura
       if (!_sistemaPausadoPorPostura) {
-        if (!_filaNormalPrioridade.contains(mensagem) && !_filaAltaPrioridade.contains(mensagem)) {
+        if (!_filaNormalPrioridade.contains(mensagem) &&
+            !_filaAltaPrioridade.contains(mensagem)) {
           _filaNormalPrioridade.add(mensagem);
         }
       }
@@ -188,107 +200,76 @@ class _SensorDashboardState extends State<SensorDashboard> {
   // =================================================================
 
   void _receberDadosAcelerometro(String valorRaw) {
-  try {
-    List<String> partes = valorRaw.split(',');
-    if (partes.length < 3) return;
+    try {
+      List<String> partes = valorRaw.split(',');
+      if (partes.length < 3) return;
 
-    double ax = double.parse(partes[0]);
-    double ay = double.parse(partes[1]);
-    double az = double.parse(partes[2]);
+      double ax = double.parse(partes[0]);
+      double ay = double.parse(partes[1]);
+      double az = double.parse(partes[2]);
 
-    // --- CÁLCULOS TRIGONOMÉTRICOS ---
-    
-    // 1. PITCH (Vertical - Olhar chão/céu)
-    // Rotação em torno do eixo Y (ou X, dependendo da montagem)
-    double pitchRad = atan(ax / sqrt(pow(ay, 2) + pow(az, 2)));
-    double pitchGraus = pitchRad * (180 / pi);
-
-    // 2. ROLL (Lateral - Orelha no ombro)
-    // Rotação em torno do eixo X. Note que invertemos: agora é AY dividido por AX+AZ
-    double rollRad = atan(ay / sqrt(pow(ax, 2) + pow(az, 2)));
-    double rollGraus = rollRad * (180 / pi);
-
-    // --- SUAVIZAÇÃO (EMA) ---
-    // Aplica filtro para o número não pular loucamente
-    _anguloVerticalCabeca = (_anguloVerticalCabeca * 0.8) + (pitchGraus * 0.2);
-    _anguloLateralCabeca = (_anguloLateralCabeca * 0.8) + (rollGraus * 0.2);
-
-    // --- LÓGICA DE SEGURANÇA ---
-    
-    // Definindo limites
-    bool olhandoBaixo = _anguloVerticalCabeca.abs() > 45; // Cabeça muito baixa
-    bool cabecaTorta = _anguloLateralCabeca.abs() > 40;   // Cabeça inclinada > 40° para os lados
-    
-    bool posturaRuim = olhandoBaixo || cabecaTorta;
-
-    // A. ENTRAR EM PAUSA (Se qualquer coisa estiver errada)
-    if (!_sistemaPausadoPorPostura && posturaRuim) {
-      setState(() {
-        _sistemaPausadoPorPostura = true;
-        // Limpa buffers
-        histFrente.clear(); histEsq.clear(); histDir.clear();
-        txtFrente = "--"; txtEsq = "--"; txtDir = "--";
-      });
-
-      // Feedback específico
-      if (olhandoBaixo) {
-        _adicionarFilaVoz("Levante a cabeça.", ehAltaPrioridade: true);
-      } else {
-        _adicionarFilaVoz("Ajeite a cabeça.", ehAltaPrioridade: true);
-      }
-    }
-    
-    // B. SAIR DA PAUSA (Só sai se TUDO estiver certo)
-    // Histerese: Exige que volte para < 30 (vertical) e < 30 (lateral) para garantir estabilidade
-    else if (_sistemaPausadoPorPostura) {
-      bool verticalSeguro = _anguloVerticalCabeca.abs() < 30;
-      bool lateralSeguro = _anguloLateralCabeca.abs() < 30;
-
-      if (verticalSeguro && lateralSeguro) {
+      if (ax > 150.0 || ay > 150.0 || az > 150.0) {
         setState(() {
-          _sistemaPausadoPorPostura = false;
+          _sistemaPausadoPorPostura = true;
+          // Limpa buffers
+          histFrente.clear();
+          histEsq.clear();
+          histDir.clear();
+          txtFrente = "--";
+          txtEsq = "--";
+          txtDir = "--";
         });
-        _adicionarFilaVoz("Leitura retomada.");
+
+        _adicionarFilaVoz("Ajeite a cabeça.", ehAltaPrioridade: true);
+      } else if (_sistemaPausadoPorPostura) {
+        // bool verticalSeguro = _anguloVerticalCabeca.abs() < 30;
+        // bool lateralSeguro = _anguloLateralCabeca.abs() < 30;
+
+        if (!(ax > 3.0 || ay > 3.0 || az > 3.0)) {
+          setState(() {
+            _sistemaPausadoPorPostura = false;
+          });
+          _adicionarFilaVoz("Leitura retomada.");
+        }
       }
+    } catch (e) {
+      // continua e ignora o erro
     }
-
-  } catch (e) {
-    // Ignora erro de parse
   }
-}
-
   // =================================================================
   // --- LÓGICA DOS SENSORES ---
   // =================================================================
 
   void _analisarFrente(Queue<double> buffer) {
-
     if (buffer.length < tamanhoBuffer) return;
     if (_sistemaPausadoPorPostura) return;
-    
-    double mediaRecente = _calcularMedia(Queue.from(buffer.skip(buffer.length - 5)));
+
+    double mediaRecente = _calcularMedia(
+      Queue.from(buffer.skip(buffer.length - 5)),
+    );
 
     if (mediaRecente < 50) {
       _adicionarFilaVoz("Pare! Frente.", ehAltaPrioridade: true);
       return;
     }
-
   }
 
- void _analisarLateral(Queue<double> buffer, String lado) {
+  void _analisarLateral(Queue<double> buffer, String lado) {
     if (buffer.length < tamanhoBuffer) return;
-    
+
     if (_sistemaPausadoPorPostura) return;
 
     double mediaAntiga = _calcularMedia(Queue.from(buffer.take(5)));
-    double mediaRecente = _calcularMedia(Queue.from(buffer.skip(buffer.length - 5)));
+    double mediaRecente = _calcularMedia(
+      Queue.from(buffer.skip(buffer.length - 5)),
+    );
 
     if ((mediaAntiga - mediaRecente) > 30 && mediaRecente < 60) {
       _adicionarFilaVoz("Cuidado $lado.", ehAltaPrioridade: true);
       return;
     }
 
-    if (mediaAntiga < 80 && mediaRecente > 150) {
+    if (mediaRecente - mediaAntiga > 150) {
       _adicionarFilaVoz("Abertura à $lado.");
     }
   }
@@ -309,7 +290,7 @@ class _SensorDashboardState extends State<SensorDashboard> {
 
       if (mounted) setState(() => txtFrente = media.toStringAsFixed(0));
       _analisarFrente(histFrente);
-    } catch (e) { }
+    } catch (e) {}
   }
 
   void _receberDadosEsquerda(String valorRaw) {
@@ -324,7 +305,9 @@ class _SensorDashboardState extends State<SensorDashboard> {
 
       if (mounted) setState(() => txtEsq = media.toStringAsFixed(0));
       _analisarLateral(histEsq, "esquerda");
-    } catch (e) {}
+    } catch (e) {
+      //
+    }
   }
 
   void _receberDadosDireita(String valorRaw) {
@@ -347,8 +330,14 @@ class _SensorDashboardState extends State<SensorDashboard> {
   // =================================================================
 
   void _startScan() {
-    if (_isConnected) { _disconnect(); return; }
-    setState(() { _isScanning = true; _status = "Procurando..."; });
+    if (_isConnected) {
+      _disconnect();
+      return;
+    }
+    setState(() {
+      _isScanning = true;
+      _status = "Procurando...";
+    });
     FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
 
     _scanSub = FlutterBluePlus.onScanResults.listen((results) {
@@ -363,7 +352,10 @@ class _SensorDashboardState extends State<SensorDashboard> {
 
     Future.delayed(const Duration(seconds: 5), () {
       if (!_isConnected && mounted) {
-        setState(() { _isScanning = false; _status = "Não encontrado."; });
+        setState(() {
+          _isScanning = false;
+          _status = "Não encontrado.";
+        });
       }
     });
   }
@@ -377,16 +369,25 @@ class _SensorDashboardState extends State<SensorDashboard> {
       device.connectionState.listen((state) {
         if (state == BluetoothConnectionState.disconnected && mounted) {
           setState(() {
-            _isConnected = false; _status = "Conexão Perdida";
-            txtFrente = "--"; txtEsq = "--"; txtDir = "--";
-            histFrente.clear(); histEsq.clear(); histDir.clear();
+            _isConnected = false;
+            _status = "Conexão Perdida";
+            txtFrente = "--";
+            txtEsq = "--";
+            txtDir = "--";
+            histFrente.clear();
+            histEsq.clear();
+            histDir.clear();
           });
           _adicionarFilaVoz("Conexão perdida", ehAltaPrioridade: true);
         }
       });
 
       if (mounted) {
-        setState(() { _isConnected = true; _isScanning = false; _status = "Sistema Ativo"; });
+        setState(() {
+          _isConnected = true;
+          _isScanning = false;
+          _status = "Sistema Ativo";
+        });
         _adicionarFilaVoz("Conectado.", ehAltaPrioridade: true);
       }
 
@@ -404,16 +405,24 @@ class _SensorDashboardState extends State<SensorDashboard> {
           String uuid = c.uuid.toString();
           await c.setNotifyValue(true);
 
-          if (uuid == charUuidS1) { // FRENTE
-            _subS1 = c.lastValueStream.listen((val) => _receberDadosFrente(String.fromCharCodes(val)));
-          } else if (uuid == charUuidS2) { // ESQUERDA
-            _subS2 = c.lastValueStream.listen((val) => _receberDadosEsquerda(String.fromCharCodes(val)));
-          } else if (uuid == charUuidS3) { // DIREITA
-            _subS3 = c.lastValueStream.listen((val) => _receberDadosDireita(String.fromCharCodes(val)));
-          } 
-          else if (uuid == charUuidAccel) {
+          if (uuid == charUuidS1) {
+            // FRENTE
+            _subS1 = c.lastValueStream.listen(
+              (val) => _receberDadosFrente(String.fromCharCodes(val)),
+            );
+          } else if (uuid == charUuidS2) {
+            // ESQUERDA
+            _subS2 = c.lastValueStream.listen(
+              (val) => _receberDadosEsquerda(String.fromCharCodes(val)),
+            );
+          } else if (uuid == charUuidS3) {
+            // DIREITA
+            _subS3 = c.lastValueStream.listen(
+              (val) => _receberDadosDireita(String.fromCharCodes(val)),
+            );
+          } else if (uuid == charUuidAccel) {
             _subAccel = c.lastValueStream.listen((val) {
-               _receberDadosAcelerometro(String.fromCharCodes(val));
+              _receberDadosAcelerometro(String.fromCharCodes(val));
             });
           }
         }
@@ -434,7 +443,10 @@ class _SensorDashboardState extends State<SensorDashboard> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text("Assistente Visual", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 24)),
+        title: const Text(
+          "Assistente Visual",
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 24),
+        ),
         backgroundColor: Colors.transparent,
         elevation: 0,
         centerTitle: true,
@@ -446,48 +458,77 @@ class _SensorDashboardState extends State<SensorDashboard> {
             width: double.infinity,
             padding: const EdgeInsets.all(12),
             // Muda a cor se estiver Pausado por Postura
-            color: _sistemaPausadoPorPostura 
+            color: _sistemaPausadoPorPostura
                 ? Colors.orange[900] // Laranja = Alerta Postura
                 : (_isConnected ? Colors.green[900] : Colors.red[900]),
             child: Text(
-              _sistemaPausadoPorPostura 
-                  ? "POSTURA INCORRETA (PAUSADO)" 
+              _sistemaPausadoPorPostura
+                  ? "POSTURA INCORRETA (PAUSADO)"
                   : _status.toUpperCase(),
               textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+                fontSize: 16,
+              ),
             ),
           ),
-          
+
           Expanded(
             child: Padding(
               padding: const EdgeInsets.all(16.0),
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                 children: [
-                  _buildCard("ESQUERDA", _sistemaPausadoPorPostura ? "--" : txtEsq, Colors.purpleAccent),
-                  _buildCard("FRENTE", _sistemaPausadoPorPostura ? "--" : txtFrente, Colors.cyanAccent, isMain: true),
-                  _buildCard("DIREITA", _sistemaPausadoPorPostura ? "--" : txtDir, Colors.orangeAccent),
+                  _buildCard(
+                    "ESQUERDA",
+                    _sistemaPausadoPorPostura ? "--" : txtEsq,
+                    Colors.purpleAccent,
+                  ),
+                  _buildCard(
+                    "FRENTE",
+                    _sistemaPausadoPorPostura ? "--" : txtFrente,
+                    Colors.cyanAccent,
+                    isMain: true,
+                  ),
+                  _buildCard(
+                    "DIREITA",
+                    _sistemaPausadoPorPostura ? "--" : txtDir,
+                    Colors.orangeAccent,
+                  ),
                 ],
               ),
             ),
           ),
-          
+
           Padding(
             padding: const EdgeInsets.fromLTRB(20, 0, 20, 30),
             child: SizedBox(
               width: double.infinity,
               height: 65,
               child: ElevatedButton.icon(
-                icon: Icon(_isConnected ? Icons.stop_circle : Icons.play_circle, size: 30),
+                icon: Icon(
+                  _isConnected ? Icons.stop_circle : Icons.play_circle,
+                  size: 30,
+                ),
                 label: Text(
                   _isConnected ? "DESCONECTAR" : "CONECTAR",
-                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 20),
+                  style: const TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 20,
+                  ),
                 ),
-                onPressed: _isScanning ? null : (_isConnected ? _disconnect : _startScan),
+                onPressed: _isScanning
+                    ? null
+                    : (_isConnected ? _disconnect : _startScan),
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: _isConnected ? Colors.red[800] : Colors.yellowAccent,
+                  backgroundColor: _isConnected
+                      ? Colors.red[800]
+                      : Colors.yellowAccent,
                   foregroundColor: _isConnected ? Colors.white : Colors.black,
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
                 ),
               ),
             ),
@@ -497,9 +538,14 @@ class _SensorDashboardState extends State<SensorDashboard> {
     );
   }
 
-  Widget _buildCard(String label, String value, Color color, {bool isMain = false}) {
+  Widget _buildCard(
+    String label,
+    String value,
+    Color color, {
+    bool isMain = false,
+  }) {
     String display = (value == "400" || value == "400.0") ? "> 4m" : value;
-    
+
     // Efeito visual de desabilitado se estiver pausado
     Color finalColor = _sistemaPausadoPorPostura ? Colors.grey : color;
     Color textColor = _sistemaPausadoPorPostura ? Colors.white38 : Colors.white;
@@ -515,22 +561,35 @@ class _SensorDashboardState extends State<SensorDashboard> {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text(label, style: TextStyle(color: textColor.withOpacity(0.7), fontSize: 18, fontWeight: FontWeight.bold)),
+          Text(
+            label,
+            style: TextStyle(
+              color: textColor.withOpacity(0.7),
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
           Row(
             children: [
               Text(
                 display,
                 style: TextStyle(
-                    fontSize: 36,
-                    fontWeight: FontWeight.bold,
-                    color: textColor,
-                    fontFamily: 'Monospace'
+                  fontSize: 36,
+                  fontWeight: FontWeight.bold,
+                  color: textColor,
+                  fontFamily: 'Monospace',
                 ),
               ),
               if (display != "> 4m" && display != "--")
                 Padding(
                   padding: const EdgeInsets.only(left: 8.0, top: 10),
-                  child: Text("cm", style: TextStyle(color: textColor.withOpacity(0.5), fontSize: 16)),
+                  child: Text(
+                    "cm",
+                    style: TextStyle(
+                      color: textColor.withOpacity(0.5),
+                      fontSize: 16,
+                    ),
+                  ),
                 ),
             ],
           ),

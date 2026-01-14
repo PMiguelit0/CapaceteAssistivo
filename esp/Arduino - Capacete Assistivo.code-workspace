@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../../../../../Documents/Arduino"
+		},
+		{
+			"name": "Gyroscope - ESP32",
+			"path": "."
+		}
+	],
+	"settings": {}
+}
